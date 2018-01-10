@@ -1,0 +1,6 @@
+*~
+*.log
+.DS_Store
+.vagrant/
+.projectile
+.dir-locals.el
