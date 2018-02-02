@@ -317,12 +317,14 @@
               (add)
               (return))))
 
-(define (disassemble bytes)
+(define (disassemble bytes [jump-targets? #f])
+  (define jumps (make-hash))
+  (define targets (make-hash))
 
   (when (string? bytes)
     (set! bytes (hex-string->bytes bytes)))
 
-  (define (asm-of byte-seq)
+  (define (asm-of byte-seq offset)
     (if (empty? byte-seq)
         '()
         (let* ((bytes   byte-seq)
@@ -330,16 +332,40 @@
                (bytes   (rest bytes))
                (opcode  (is-opcode (hash-ref isa-by-bytecode opbyte)))
                (argsize (if (push? opcode) (push-arg-size opcode) 0))
-               (args    (if (positive? argsize)
-                            (bytes->integer
-                             (list->bytes
-                              (take bytes argsize))
-                             #f)
+               (arg     (if (positive? argsize)
+                            (list
+                             (bytes->integer
+                              (list->bytes
+                               (take bytes argsize))
+                              #f))
                             '())))
-          (cons (cons opcode args)
-                (asm-of (drop bytes argsize))))))
+          (when jump-targets?
+            (cond
+              ((= argsize 2)             (hash-set! jumps offset (first arg)))
+              ((equal? opcode 'JUMPDEST) (hash-set! targets
+                                                    offset
+                                                    (list 'label (gensym))))))
+          (cons (list offset (cons opcode arg))
+                (asm-of (drop bytes argsize) (+ offset 1 argsize))))))
 
-  (asm-of (bytes->list bytes)))
+  (define (or-false) #f)
+  (define (with-label instruction)
+    (match instruction
+      [(list-rest offset _)
+       (cond
+         ((hash-has-key? jumps offset)   (let* ((target (hash-ref jumps offset))
+                                                (label  (hash-ref targets target or-false)))
+                                           (if label
+                                               (list offset (list 'push label))
+                                               instruction)))
+
+         ((hash-has-key? targets offset) (list offset (hash-ref targets offset)))
+
+         (else                           instruction))]))
+
+  (if jump-targets?
+      (map with-label (asm-of (bytes->list bytes) 0))
+      (asm-of (bytes->list bytes) 0)))
 
 (module+ test
   (disassemble
@@ -352,7 +378,8 @@
                (label a)
                (push1 1)
                (add)
-               (return)))))
+               (return)))
+   #t))
 
 #|
 (struct instr (asm
