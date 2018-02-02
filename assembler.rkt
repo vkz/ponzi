@@ -317,6 +317,43 @@
               (add)
               (return))))
 
+(define (disassemble bytes)
+
+  (when (string? bytes)
+    (set! bytes (hex-string->bytes bytes)))
+
+  (define (asm-of byte-seq)
+    (if (empty? byte-seq)
+        '()
+        (let* ((bytes   byte-seq)
+               (opbyte  (first bytes))
+               (bytes   (rest bytes))
+               (opcode  (is-opcode (hash-ref isa-by-bytecode opbyte)))
+               (argsize (if (push? opcode) (push-arg-size opcode) 0))
+               (args    (if (positive? argsize)
+                            (bytes->integer
+                             (list->bytes
+                              (take bytes argsize))
+                             #f)
+                            '())))
+          (cons (cons opcode args)
+                (asm-of (drop bytes argsize))))))
+
+  (asm-of (bytes->list bytes)))
+
+(module+ test
+  (disassemble
+   (assemble '((push1 #x01)
+               (push1 #x02)
+               (add)
+               (push (label a))
+               (jump)
+               (push4 #xffffffff)
+               (label a)
+               (push1 1)
+               (add)
+               (return)))))
+
 #|
 (struct instr (asm
                bytes
