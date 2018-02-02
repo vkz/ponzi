@@ -299,6 +299,24 @@
                                  (add)
                                  (return))))
 
+(define (assemble instructions)
+  (bytes->hex-string
+   (apply bytes-append
+          (map (match-lambda [(list _ hex _) (hex-string->bytes hex)])
+               (instructions/patched-labels instructions)))))
+
+(module+ test
+  (assemble '((push1 #x01)
+              (push1 #x02)
+              (add)
+              (push (label a))
+              (jump)
+              (push4 #xffffffff)
+              (label a)
+              (push1 1)
+              (add)
+              (return))))
+
 #|
 (struct instr (asm
                bytes
