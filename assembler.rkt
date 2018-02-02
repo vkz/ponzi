@@ -349,19 +349,21 @@
                 (asm-of (drop bytes argsize) (+ offset 1 argsize))))))
 
   (define (or-false) #f)
+
+  (define (target->label? offset)
+    (hash-ref targets offset or-false))
+
+  (define (jump->label? offset)
+    (target->label?
+     (hash-ref jumps offset or-false)))
+
   (define (with-label instruction)
     (match instruction
       [(list-rest offset _)
        (cond
-         ((hash-has-key? jumps offset)   (let* ((target (hash-ref jumps offset))
-                                                (label  (hash-ref targets target or-false)))
-                                           (if label
-                                               (list offset (list 'push label))
-                                               instruction)))
-
-         ((hash-has-key? targets offset) (list offset (hash-ref targets offset)))
-
-         (else                           instruction))]))
+         ((jump->label? offset)   => (λ (label) (list offset (list 'push label))))
+         ((target->label? offset) => (λ (label) (list offset label)))
+         (else instruction))]))
 
   (if jump-targets?
       (map with-label (asm-of (bytes->list bytes) 0))
