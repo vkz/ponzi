@@ -34,7 +34,9 @@
 (define isa
   (map (match-lambda
          [(list bytecode opcode pops pushes size)
-          ;; =>
+          ;; (#x60 PUSH1 0 1 1)
+          ;; ---------------------
+          ;; (is 96 'PUSH1 0 1 1 #"`")
           (is bytecode opcode pops pushes size (integer->bytes bytecode size #f))])
        '(
          ;; x0_
@@ -245,47 +247,71 @@
      (string-upcase
       (symbol->string opcode))))
 
-  (define (is/offset is)
+  (define (instruction/offset is)
     (match is
-      [(list 'label label) (assert (not (hash-has-key? labels label)))
-                           (hash-set! labels label offset)
-                           (list (offset+ (instruction-size 'JUMPDEST))
-                                 (bytes->hex-string
-                                  (bytes-of-opcode 'JUMPDEST))
-                                 is)]
 
-      [(list 'push (list 'label label)) (list (offset+ 3)
-                                              (λ ()
-                                                (bytes->hex-string
-                                                 (bytes-append
-                                                  (bytes-of-opcode 'PUSH2)
-                                                  (integer->bytes (hash-ref labels label)
-                                                                  2 #f))))
-                                              (λ () `(push ,(hash-ref labels label))))]
-      ;; other instructions
-      [(list (? push? (app upcase op)) addr) (list (offset+ (instruction-size op))
-                                                   (bytes->hex-string
-                                                    (bytes-append
-                                                     (bytes-of-opcode op)
-                                                     (integer->bytes addr
-                                                                     (push-arg-size op)
-                                                                     #f)))
-                                                   is)]
+      ;; instruction
+      ;; ---------------------
+      ;; (offset hex-string instruction)
 
-      [(list (app upcase op)) (list (offset+ (instruction-size op))
-                                    (bytes->hex-string
-                                     (bytes-of-opcode op))
-                                    is)]))
+      [(list 'label label)
+       ;; (label a)
+       ;; ---------------------
+       ;; (14 "5b" (label a))
+       (assert (not (hash-has-key? labels label)))
+       (hash-set! labels label offset)
+       (list (offset+ (instruction-size 'JUMPDEST))
+             (bytes->hex-string
+              (bytes-of-opcode 'JUMPDEST))
+             is)]
+
+      [(list 'push (list 'label label))
+       ;; (push (label a))
+       ;; ---------------------
+       ;; (5 "61000e" (push 14))
+       (list (offset+ 3)
+             (λ ()
+               (bytes->hex-string
+                (bytes-append
+                 (bytes-of-opcode 'PUSH2)
+                 (integer->bytes (hash-ref labels label)
+                                 2 #f))))
+             (λ () `(push ,(hash-ref labels label))))]
+
+      [(list (? push? (app upcase op)) addr)
+       ;; (PUSH4 #xFFFFFFFF)
+       ;; ---------------------
+       ;; (9 "63ffffffff" (push4 4294967295))
+       (list (offset+ (instruction-size op))
+             (bytes->hex-string
+              (bytes-append
+               (bytes-of-opcode op)
+               (integer->bytes addr
+                               (push-arg-size op)
+                               #f)))
+             is)]
+
+      [(list (app upcase op))
+       ;; (add)
+       ;; ---------------------
+       ;; (17 "01" (add))
+       (list (offset+ (instruction-size op))
+             (bytes->hex-string
+              (bytes-of-opcode op))
+             is)]))
 
   (define (patch-label is)
     (match is
       [(list addr (? procedure? patch-bytecode) (? procedure? patch-instruction))
+       ;; (5 λ1 λ2)
+       ;; ---------------------
+       ;; (5 (λ1) (λ2))
        (list addr (patch-bytecode) (patch-instruction))]
 
       [_ is]))
 
   (map patch-label
-       (map is/offset instructions)))
+       (map instruction/offset instructions)))
 
 (module+ test
   (instructions/patched-labels '((push1 #x01)
@@ -318,12 +344,27 @@
               (return))))
 
 (define (disassemble bytes [jump-targets? #f])
-  (define jumps (make-hash))
-  (define targets (make-hash))
-
   (when (string? bytes)
     (set! bytes (hex-string->bytes bytes)))
 
+  ;; constantly #f
+  (define (or-false) #f)
+
+  ;; table: offset of (PUSH2 addr?)  => addr?
+  (define jumps (make-hash))
+  ;; table: addr => (label (gensym))
+  (define targets (make-hash))
+
+  ;; retrieve generated label by offset of its def
+  (define (target->label? offset)
+    (hash-ref targets offset or-false))
+
+  ;; retrieve generated label by offset of its use
+  (define (jump->label? offset)
+    (target->label?
+     (hash-ref jumps offset or-false)))
+
+  ;; generate bytecode
   (define (asm-of byte-seq offset)
     (if (empty? byte-seq)
         '()
@@ -348,15 +389,8 @@
           (cons (list offset (cons opcode arg))
                 (asm-of (drop bytes argsize) (+ offset 1 argsize))))))
 
-  (define (or-false) #f)
-
-  (define (target->label? offset)
-    (hash-ref targets offset or-false))
-
-  (define (jump->label? offset)
-    (target->label?
-     (hash-ref jumps offset or-false)))
-
+  ;; Jump target is is any argument to PUSH2 that allso happens to be an offset in the
+  ;; code. This is ambiguous and may result in false labels being generated.
   (define (with-label instruction)
     (match instruction
       [(list-rest offset _)
