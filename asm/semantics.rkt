@@ -1,11 +1,83 @@
 #lang racket
 
-(define *log*   (make-parameter '()))
-(define *gas*   (make-parameter 0))
-(define *pc*    (make-parameter 0))
-(define *store* (make-parameter (hasheq)))
-(define *stack* (make-parameter '()))
-(define *mem*   (make-parameter (bytes)))
+(require racket/undefined)
+(provide (all-defined-out))
+
+(struct Halt (state) #:transparent)
+(struct Stop Halt () #:transparent)
+(struct Suicide Halt () #:transparent)
+(struct Return Halt (bytes) #:transparent)
+(struct Exn Halt (reason) #:transparent)
+
+(define halt
+  (match-lambda*
+    [(list 'STOP)         (Stop (state-snapshot))]
+    [(list 'SUICIDE)      (Suicide (state-snapshot))]
+    [(list 'RETURN bytes) (Return (state-snapshot) bytes)]
+    [(list 'EXN reason)   (Exn (state-snapshot) reason)]))
+
+(struct mu (gas pc mem i stack) #:transparent)
+(define (state-snapshot)
+  (mu (*gas*)
+      (*pc*)
+      (mem)
+      (bytes-length (mem))
+      (stack)))
+
+(struct I (account origin gasprice data sender value bytecode calldepth)
+  #:transparent)
+
+(struct exn:evm exn (state) #:transparent)
+(struct exn:evm:out-of-gas exn:evm () #:transparent)
+(struct exn:evm:stack-underflow exn:evm () #:transparent)
+(struct exn:evm:stack-overflow exn:evm () #:transparent)
+(struct exn:evm:jumpdest exn:evm () #:transparent)
+(struct exn:evm:stop exn:evm () #:transparent)
+
+(define (make-exn-evm exn-type msg)
+  (λ () (exn-type (string-append msg
+                                 (format " at instruction ~a"
+                                         (instructions (*pc*))))
+                  (current-continuation-marks)
+                  (state-snapshot))))
+(define make-exn:evm:out-of-gas (make-exn-evm exn:evm:out-of-gas "Out of gas"))
+(define make-exn:evm:stack-underflow (make-exn-evm exn:evm:stack-underflow "Stack underflow"))
+(define make-exn:evm:stack-overflow (make-exn-evm exn:evm:stack-overflow "Stack overflow"))
+(define make-exn:evm:jumpdest (make-exn-evm exn:evm:jumpdest "Not a jumpdest"))
+(define make-exn:evm:stop (make-exn-evm exn:evm:stop "Stopped"))
+
+(define evm-raise (match-lambda*
+                    [(list 'out-of-gas) (raise (make-exn:evm:out-of-gas))]
+                    [(list 'underflow)  (raise (make-exn:evm:stack-underflow))]
+                    [(list 'overflow)   (raise (make-exn:evm:stack-overflow))]
+                    [(list 'jumpdest)   (raise (make-exn:evm:jumpdest))]
+                    [(list 'stop)       (raise (make-exn:evm:stop))]))
+
+;; TODO when populating *instructions* it is safe to add STOP as the very last instruction
+;; which IIUC YP implies (see def of ω in section 9).
+(define *instructions* (make-parameter (masheq)))
+(define *log*      (make-parameter '()))
+(define *suicides* (make-parameter '()))
+(define *gas*      (make-parameter 0))
+(define *pc*       (make-parameter 0))
+(define *store*    (make-parameter (hasheq)))
+(define *stack*    (make-parameter '()))
+(define *mem*      (make-parameter (bytes)))
+(define *I*        (make-parameter (I undefined undefined 0 #"" undefined 0 #"" 0)))
+
+(define (info-account) (I-account (*I*)))
+(define (info-origin) (I-origin (*I*)))
+(define (info-gasprice) (I-gasprice (*I*)))
+(define (info-data) (I-data (*I*)))
+(define (info-sender) (I-sender (*I*)))
+(define (info-value) (I-value (*I*)))
+(define (info-bytecode) (I-bytecode (*I*)))
+(define (info-calldepth) (I-calldepth (*I*)))
+
+(define instructions
+  (case-lambda
+    [()   (*instructions*)]
+    [(pc) (hash-ref (*instructions*) pc)]))
 
 (define log (match-lambda*
               [(list) (*log*)]
@@ -22,16 +94,21 @@
                 ;; Must use gas, alter substate
                 [(k v) (*store* (hash-set (*store*) k v))]))
 
+
+(define (stack/overflow! s)
+  (when (> (length s) 1024) (evm-raise 'overflow))
+  (*stack* s))
+
 (define stack (match-lambda*
                 ;; get current stack value
-                [(list)    (*stack*)]
+                [(list)              (*stack*)]
                 ;; reset stack to a new value
-                [(list (list s ...)) (*stack* s)]
+                [(list (list s ...)) (stack/overflow! s)]
                 ;; push element on the stack
-                [(list e)   (*stack* (cons e (*stack*)))]
+                [(list e)            (stack/overflow! (cons e (*stack*)))]
                 ;; construct stack from s with e on top, use to replace top element after
                 ;; pattern matching on stack
-                [(list e s) (*stack* (cons e s))]))
+                [(list e s)          (stack/overflow! (cons e s))]))
 
 (define mem (match-lambda*
               ;; get a copy of the entire memory
@@ -89,28 +166,30 @@
 ;; (#x0a EXP        2 1 1)
 ;; (#x0b SIGNEXTEND 2 1 1)
 
-
-
 (define (stop)
-  (evm-state 'STOP))
+  (pc++)
+  (halt 'STOP))
 
 (define (add)
   (match (stack)
     [(list l r s ...) (stack (+ l r) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (mul)
   (match (stack)
     [(list l r s ...) (stack (* l r) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (sub)
   (match (stack)
     [(list l r s ...) (stack (- l r) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (div)
   ;; Racket's / is signed! Different semantics?
@@ -118,7 +197,8 @@
     [(list l 0 s ...) (stack 0 s)]
     [(list l r s ...) (stack (/ l r) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (sdiv)
   (unimplemented 'sdiv))
@@ -130,7 +210,8 @@
     [(list l r s ...)   (stack (remainder l r) s)]
     [(list _ _)         (evm-raise 'underflow)]
     [(list _)           (evm-raise 'underflow)]
-    [(list)             (evm-raise 'underflow)]))
+    [(list)             (evm-raise 'underflow)])
+  (pc++))
 
 (define (smod)
   (unimplemented 'smod))
@@ -141,7 +222,8 @@
     [(list l r m s ...) (stack (remainder (+ l r)) s)]
     [(list _ _)         (evm-raise 'underflow)]
     [(list _)           (evm-raise 'underflow)]
-    [(list)             (evm-raise 'underflow)]))
+    [(list)             (evm-raise 'underflow)])
+  (pc++))
 
 (define (mulmod)
   (match (stack)
@@ -149,13 +231,15 @@
     [(list l r m s ...) (stack (remainder (* l r)) s)]
     [(list _ _)         (evm-raise 'underflow)]
     [(list _)           (evm-raise 'underflow)]
-    [(list)             (evm-raise 'underflow)]))
+    [(list)             (evm-raise 'underflow)])
+  (pc++))
 
 (define (exp)
   (match (stack)
     [(list l r s ...) (stack (expt l r) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (signextend)
   (unimplemented 'signextend))
@@ -179,13 +263,15 @@
   (match (stack)
     [(list l r s ...) (stack (if (< l r) 1 0) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (gt)
   (match (stack)
     [(list l r s ...) (stack (if (> l r) 1 0) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (slt)
   (unimplemented 'slt))
@@ -197,35 +283,41 @@
   (match (stack)
     [(list l r s ...) (stack (if (equal? l r) 1 0) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (iszero)
   (match (stack)
     [(list v s ...) (stack (if (zero? v) 1 0) s)]
-    [(list)         (evm-raise 'underflow)]))
+    [(list)         (evm-raise 'underflow)])
+  (pc++))
 
 (define (and)
   (match (stack)
     [(list l r s ...) (stack (bitwise-and l r) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (or)
   (match (stack)
     [(list l r s ...) (stack (bitwise-ior l r) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (xor)
   (match (stack)
     [(list l r s ...) (stack (bitwise-xor l r) s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 (define (not)
   (match (stack)
     [(list v s ...) (stack (bitwise-not v) s)]
-    [(list)         (evm-raise 'underflow)]))
+    [(list)         (evm-raise 'underflow)])
+  (pc++))
 
 (define (byte)
   (match (stack)
@@ -237,7 +329,8 @@
     ;; machine e.g. offset = (- 32 (add1 offset)).
     [(list at n s ...) (stack (bitwise-bit-field n at 8) s)]
     [(list _)          (evm-raise 'underflow)]
-    [(list)            (evm-raise 'underflow)]))
+    [(list)            (evm-raise 'underflow)])
+  (pc++))
 
 ;;** 0x2_
 
@@ -263,31 +356,38 @@
 ;; (#x3c EXTCODECOPY  4 0 1)
 
 (define (address)
-  (push-stack (info-address)))
+  (stack (info-account))
+  (pc++))
 
 (define (balance)
   (match (stack)
     [(list (app account a) s ...) (stack (or (account-balance a) 0) s)]
-    [(list)                                 (evm-raise 'underflow)]))
+    [(list)                                 (evm-raise 'underflow)])
+  (pc++))
 
 (define (origin)
-  (stack (info-origin)))
+  (stack (info-origin))
+  (pc++))
 
 (define (caller)
-  (stack (info-caller)))
+  (stack (info-sender))
+  (pc++))
 
 (define (callvalue)
-  (stack (info-value)))
+  (stack (info-value))
+  (pc++))
 
 (define (calldataload)
   (match (stack)
     [(list offset s ...) (if (< offset (length (info-data)))
                              (stack (word-at offset (info-data)) s)
                              (stack 0 s))]
-    [(list)              (evm-raise 'underflow)]))
+    [(list)              (evm-raise 'underflow)])
+  (pc++))
 
 (define (calldatasize)
-  (stack (calldata-length)))
+  (stack (calldata-length))
+  (pc++))
 
 (define (get-subbytes bytes start end #:stop stop-thunk)
   (let* ((size   (- end start))
@@ -303,7 +403,7 @@
 
 ;; TODO How to STOP EVM mid execution?
 (define (subbytes/stop bytes start end)
-  (get-subbytes bytes start end #:stop (λ () (unimplemented 'STOP))))
+  (get-subbytes bytes start end #:stop (λ () (evm-raise 'stop))))
 
 (define (subbytes/0 bytes start end)
   (get-subbytes bytes start end #:stop #f))
@@ -330,10 +430,12 @@
      (stack s)]
     [(list _ _) (evm-raise 'underflow)]
     [(list _)   (evm-raise 'underflow)]
-    [(list)     (evm-raise 'underflow)]))
+    [(list)     (evm-raise 'underflow)])
+  (pc++))
 
 (define (codesize)
-  (stack (bytes-length (info-bytecode))))
+  (stack (bytes-length (info-bytecode)))
+  (pc++))
 
 (define (codecopy)
   (match (stack)
@@ -345,15 +447,18 @@
      (stack s)]
     [(list _ _) (evm-raise 'underflow)]
     [(list _)   (evm-raise 'underflow)]
-    [(list)     (evm-raise 'underflow)]))
+    [(list)     (evm-raise 'underflow)])
+  (pc++))
 
 (define (gasprice)
-  (stack (info-gasprice)))
+  (stack (info-gasprice))
+  (pc++))
 
 (define (extcodesize)
   (match (stack)
     [(list (app account a) s ...) (stack (bytes-length (info-bytecode a)) s)]
-    [(list)                       (evm-raise 'underflow)]))
+    [(list)                       (evm-raise 'underflow)])
+  (pc++))
 
 (define (extcodecopy)
   (match (stack)
@@ -365,7 +470,8 @@
      (stack s)]
     [(list _ _) (evm-raise 'underflow)]
     [(list _)   (evm-raise 'underflow)]
-    [(list)     (evm-raise 'underflow)]))
+    [(list)     (evm-raise 'underflow)])
+  (pc++))
 
 ;;** x4_
 ;;
@@ -402,12 +508,14 @@
 (define (pop)
   (match (stack)
     [(list _ s ...) (stack s)]
-    [(list)         (evm-raise 'underflow)]))
+    [(list)         (evm-raise 'underflow)])
+  (pc++))
 
 (define (mload)
   (match (stack)
     [(list offset s ...) (stack (mem offset) s)]
-    [(list)              (evm-raise 'underflow)]))
+    [(list)              (evm-raise 'underflow)])
+  (pc++))
 
 (define (mstore)
   (match (stack)
@@ -415,7 +523,8 @@
                                     (integer->bytes n 32 #f))
                            (stack s)]
     [(list _)              (evm-raise 'underflow)]
-    [(list)                (evm-raise 'underflow)]))
+    [(list)                (evm-raise 'underflow)])
+  (pc++))
 
 (define (mstore8)
   (match (stack)
@@ -426,51 +535,54 @@
                                      (bitwise-and n #xff) 1))
                            (stack s)]
     [(list _)              (evm-raise 'underflow)]
-    [(list)                (evm-raise 'underflow)]))
+    [(list)                (evm-raise 'underflow)])
+  (pc++))
 
 (define (sload)
   (match (stack)
     [(list k s ...) (stack (store k) s)]
-    [(list)         (evm-raise 'underflow)]))
+    [(list)         (evm-raise 'underflow)])
+  (pc++))
 
 (define (sstore)
   (match (stack)
     [(list k v s ...) (store k v)
                       (stack s)]
     [(list _)         (evm-raise 'underflow)]
-    [(list)           (evm-raise 'underflow)]))
+    [(list)           (evm-raise 'underflow)])
+  (pc++))
 
 ;; Every other instruction implies pc++. Should this be done explicitly?
 (define (jump)
   (match (stack)
-    [(list offset s ...) (pc offset)
-                         (stack s)]
+    [(list offset s ...) (stack s)
+                         (pc offset)]
     [(list)              (evm-raise 'undeflow)]))
 
 (define (jumpi)
   (match (stack)
-    [(list offset test s ...) (when (zero? test)
+    [(list offset test s ...) (stack s)
+                              (if (zero? test)
                                 (pc offset)
-                                ;; else implies pc++
-                                )
-                              (stack s)]
+                                (pc++))]
     [(list _)                 (evm-raise 'underflow)]
     [(list)                   (evm-raise 'underflow)]))
 
-;; We conflate EVM's instructions PC and GAS here with Racket implementation, but it'll do
-;; for now.
-(define pc (case-lambda
-             [()   (stack (*pc*))]
-             [(pc) (*pc* pc)]))
+(define (pc)
+  (stack (*pc*))
+  (pc++))
+
+(define (pc++) (*pc* (add1 (*pc*))))
 
 (define (msize)
   (stack (bytes-length (mem))))
 
-(define gas (case-lambda
-              [()   (stack (*gas*))]
-              [(gas) (*gas* gas)]))
+(define (gas)
+  (stack (*gas*))
+  (pc++))
 
-(define (jumpdest) (void))
+(define (jumpdest)
+  (pc++))
 
 ;;** x6_ and x7_
 ;; (#x60 PUSH1        0 1 1)
@@ -510,7 +622,9 @@
   (stack
    (bytes->integer
     (integer->bytes val n #f)
-    #f)))
+    #f))
+  (pc++)
+  (pc++ n))
 
 (match-define
   (list push1  push2  push3  push4  push5  push6  push7  push8
@@ -541,7 +655,8 @@
 (define (dup-nth n)
   (λ () (if (< (length (stack)) n)
             (evm-raise 'underflow)
-            (stack (list-ref (stack) (sub1 n))))))
+            (begin (stack (list-ref (stack) (sub1 n)))
+                   (pc++)))))
 
 (match-define
   (list dup1  dup2  dup3  dup4  dup5  dup6  dup7  dup8
@@ -573,7 +688,8 @@
       (evm-raise 'underflow))
     (define 1st (first (stack)))
     (define nth (list-ref (stack) n))
-    (stack nth (rest (list-set (stack) n 1st)))))
+    (stack nth (rest (list-set (stack) n 1st)))
+    (pc++)))
 
 (match-define
   (list swap1  swap2  swap3  swap4  swap5  swap6  swap7  swap8
@@ -593,35 +709,40 @@
     [(list offset size s ...) (log offset size)
                               (stack s)]
     [(list args ...)          #:when (λ () (< (length args) 2))
-                              (evm-raise 'underflow)]))
+                              (evm-raise 'underflow)])
+  (pc++))
 
 (define (log1)
   (match (stack)
     [(list offset size t s ...) (log offset size t)
                                 (stack s)]
     [(list args ...)            #:when (λ () (< (length args) 3))
-                                (evm-raise 'underflow)]))
+                                (evm-raise 'underflow)])
+  (pc++))
 
 (define (log2)
   (match (stack)
     [(list offset size t1 t2 s ...) (log offset size t1 t2)
                                     (stack s)]
     [(list args ...)                #:when (λ () (< (length args) 4))
-                                    (evm-raise 'underflow)]))
+                                    (evm-raise 'underflow)])
+  (pc++))
 
 (define (log3)
   (match (stack)
     [(list offset size t1 t2 t3 s ...) (log offset size t1 t2 t3)
                                        (stack s)]
     [(list args ...)                   #:when (λ () (< (length args) 5))
-                                       (evm-raise 'underflow)]))
+                                       (evm-raise 'underflow)])
+  (pc++))
 
 (define (log4)
   (match (stack)
     [(list offset size t1 t2 t3 t4 s ...) (log offset size t1 t2 t3 t4)
                                           (stack s)]
     [(list args ...)                      #:when (λ () (< (length args) 6))
-                                          (evm-raise 'underflow)]))
+                                          (evm-raise 'underflow)])
+  (pc++))
 
 ;;** xF_
 ;; (#xf0 CREATE       3 1 1)
@@ -647,7 +768,8 @@
                                     ]
     [(list _ _) (evm-raise 'underflow)]
     [(list _)   (evm-raise 'underflow)]
-    [(list)     (evm-raise 'underflow)]))
+    [(list)     (evm-raise 'underflow)])
+  (pc++))
 
 ;; (message-call #:sender s
 ;;               #:originator o
@@ -685,7 +807,8 @@
          (mwrite! out-offset return-bytes))
      (stack return-code s)]
     [(list args ...) #:when (λ () (< (length args) 7))
-                     (evm-raise 'underflow)]))
+                     (evm-raise 'underflow)])
+  (pc++))
 
 (define (callcode)
   (match (stack)
@@ -706,13 +829,14 @@
          (mwrite! out-offset return-bytes))
      (stack return-code s)]
     [(list args ...) #:when (λ () (< (length args) 7))
-                     (evm-raise 'underflow)]))
+                     (evm-raise 'underflow)])
+  (pc++))
 
 (define (return)
   (match (stack)
     [(list offset size s ...) (stack s)
-                              (evm-state 'HALT)
-                              (halt (mem offset size))]
+                              (pc++)
+                              (halt 'RETURN (mem offset size))]
     [(list _) (evm-raise 'underflow)]
     [(list)   (evm-raise 'underflow)]))
 
@@ -736,7 +860,8 @@
          (mwrite! out-offset return-bytes))
      (stack return-code s)]
     [(list args ...) #:when (λ () (< (length args) 6))
-                     (evm-raise 'underflow)]))
+                     (evm-raise 'underflow)])
+  (pc++))
 
 (define (revert)
   (unimplemented 'revert))
@@ -755,4 +880,5 @@
                             (stack s)
                             (*suicides* (cons (info-account) (*suicides*)))
                             (refund)
+                            (pc++)
                             (halt 'SUICIDE)]))
