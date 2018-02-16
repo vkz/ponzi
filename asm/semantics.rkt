@@ -1,7 +1,17 @@
 #lang racket
 
-(require racket/undefined)
+(require racket/undefined
+         (only-in binaryio
+                  integer->bytes
+                  bytes->integer))
 (provide (all-defined-out))
+
+;; σ in YP
+(define *blockchain* (make-parameter (hasheq)))
+(define (find-account addr)
+  ((*blockchain*) addr))
+
+(struct account (address balance))
 
 (struct Halt (state) #:transparent)
 (struct Stop Halt () #:transparent)
@@ -55,7 +65,7 @@
 
 ;; TODO when populating *instructions* it is safe to add STOP as the very last instruction
 ;; which IIUC YP implies (see def of ω in section 9).
-(define *instructions* (make-parameter (masheq)))
+(define *instructions* (make-parameter (hasheq)))
 (define *log*      (make-parameter '()))
 (define *suicides* (make-parameter '()))
 (define *gas*      (make-parameter 0))
@@ -65,13 +75,13 @@
 (define *mem*      (make-parameter (bytes)))
 (define *I*        (make-parameter (I undefined undefined 0 #"" undefined 0 #"" 0)))
 
-(define (info-account) (I-account (*I*)))
-(define (info-origin) (I-origin (*I*)))
-(define (info-gasprice) (I-gasprice (*I*)))
-(define (info-data) (I-data (*I*)))
-(define (info-sender) (I-sender (*I*)))
-(define (info-value) (I-value (*I*)))
-(define (info-bytecode) (I-bytecode (*I*)))
+(define (info-account)   (I-account (*I*)))
+(define (info-origin)    (I-origin (*I*)))
+(define (info-gasprice)  (I-gasprice (*I*)))
+(define (info-data)      (I-data (*I*)))
+(define (info-sender)    (I-sender (*I*)))
+(define (info-value)     (I-value (*I*)))
+(define (info-bytecode)  (I-bytecode (*I*)))
 (define (info-calldepth) (I-calldepth (*I*)))
 
 (define instructions
@@ -361,8 +371,8 @@
 
 (define (balance)
   (match (stack)
-    [(list (app account a) s ...) (stack (or (account-balance a) 0) s)]
-    [(list)                                 (evm-raise 'underflow)])
+    [(list (app find-account a) s ...) (stack (or (account-balance a) 0) s)]
+    [(list)                            (evm-raise 'underflow)])
   (pc++))
 
 (define (origin)
@@ -379,14 +389,12 @@
 
 (define (calldataload)
   (match (stack)
-    [(list offset s ...) (if (< offset (length (info-data)))
-                             (stack (word-at offset (info-data)) s)
-                             (stack 0 s))]
+    [(list offset s ...) (stack (subbytes/0 (info-data) offset (+ offset 32)))]
     [(list)              (evm-raise 'underflow)])
   (pc++))
 
 (define (calldatasize)
-  (stack (calldata-length))
+  (stack (bytes-length (info-data)))
   (pc++))
 
 (define (get-subbytes bytes start end #:stop stop-thunk)
@@ -572,7 +580,9 @@
   (stack (*pc*))
   (pc++))
 
-(define (pc++) (*pc* (add1 (*pc*))))
+(define pc++ (case-lambda
+               [() (*pc* (add1 (*pc*)))]
+               [(n) (*pc* (+ n (*pc*)))]))
 
 (define (msize)
   (stack (bytes-length (mem))))
@@ -757,6 +767,11 @@
 ;; Programmaticaly CREATE account with associated code. Not the same as deploying a new
 ;; contract. This is like contract deploying a new contract - a meta-contract?
 (define (create)
+
+  (define (create-account #:value balance
+                          #:code bytes)
+    (unimplemented 'create-account))
+
   (match (stack)
     ;; TODO set all info parameters correctly.
     [(list value offset size s ...) (stack (create-account #:value value
@@ -771,16 +786,20 @@
     [(list)     (evm-raise 'underflow)])
   (pc++))
 
-;; (message-call #:sender s
-;;               #:originator o
-;;               #:recipient r             ; to? aka #:to
-;;               #:account/code c          ; usually c = r
-;;               #:gas g
-;;               #:gasprice p
-;;               #:value v
-;;               #:value~ v~
-;;               #:input i                 ; d in YP - input bytearray
-;;               #:calldepth e)
+(define (message-call #:sender       s
+                      #:originator   o
+                      #:recipient    r          ; to? aka #:to
+                      #:account/code c          ; usually c = r
+                      #:gas          g
+                      #:gasprice     p
+                      #:value        v
+                      #:value~       v~
+                      #:input        i          ; d in YP - input bytearray
+                      #:calldepth    e)
+  (unimplemented 'mellage-call))
+
+(define (callgas gas)
+  (unimplemented 'callgas))
 
 (define (call)
   (match (stack)
@@ -870,8 +889,17 @@
   (unimplemented 'invalid))
 
 (define (suicide)
+
+  (define (send-money #:value balance
+                      #:from  from-account
+                      #:to    to-account)
+    (unimplemented 'send-money))
+
+  (define (refund)
+    (unimplemented 'refund))
+
   (match (stack)
-    [(list recipient s ...) (send-money (balance (info-account))
+    [(list recipient s ...) (send-money (account-balance (info-account))
                                         #:from (info-account)
                                         #:to recipient)
                             ;; assert:
@@ -882,3 +910,20 @@
                             (refund)
                             (pc++)
                             (halt 'SUICIDE)]))
+
+(module+ test
+  (parameterize ((*pc*    0)
+                 (*stack* '())
+                 (*mem*   (bytes))
+                 (*I*     (I undefined undefined 0 #"" undefined 0 #"" 0)))
+    (push1 #x01)
+    (push1 #x02)
+    (add)
+    (push1 1)
+    (add)
+    ;; mstore to return
+    (push1 0)
+    (mstore)
+    (push1 32)
+    (push1 0)
+    (return)))
