@@ -4,6 +4,10 @@
          (for-syntax syntax/parse
                      (only-in racket/pretty pretty-print)))
 
+(provide instructions/patched-labels
+         assemble
+         disassemble)
+
 ;; loc len (op arg)                hex-string
 ;; -------------------------------------------------------
 ;; 00  2   (push1 #x01)            ; 60__          => 6001
@@ -314,6 +318,7 @@
        (map instruction/offset instructions)))
 
 (module+ test
+  (displayln "Test 1 instructions/patched-labels")
   (instructions/patched-labels '((push1 #x01)
                                  (push1 #x02)
                                  (add)
@@ -332,6 +337,7 @@
                (instructions/patched-labels instructions)))))
 
 (module+ test
+  (displayln "Test 2 assemble")
   (assemble '((push1 #x01)
               (push1 #x02)
               (add)
@@ -404,6 +410,7 @@
       (asm-of (bytes->list bytes) 0)))
 
 (module+ test
+  (displayln "Test 3 disassemble")
   (disassemble
    (assemble '((push1 #x01)
                (push1 #x02)
