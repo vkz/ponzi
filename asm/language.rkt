@@ -6,7 +6,8 @@
           (only-in racket/pretty pretty-print)
           (only-in "../assembler.rkt" instructions/patched-labels))
          (only-in racket/pretty pretty-print)
-         "semantics.rkt")
+         "semantics.rkt"
+         "evm.rkt")
 
 (define-for-syntax (table-of-instructions is)
   #`(make-hash
@@ -16,7 +17,7 @@
           is))))
 
 (module+ test
-  (displayln "Test 1")
+  (displayln "Test 1 instructions")
   (begin-for-syntax
     (pretty-print
      (table-of-instructions '((0 "6001" (push1 1))
@@ -37,11 +38,8 @@
                                (syntax->datum #'(is ...))))))
                   ;; lose hygiene
                   (with-syntax ([name (datum->syntax stx 'instructions)])
-                    #`(begin
-                        (define name #,table)
-                        ;; (pretty-print instructions)
-                        ;; ((hash-ref instructions 0))
-                        )))]))
+                    #`(parameterize ((*instructions* #,table))
+                        (evm))))]))
 
 (module+ test
   (displayln "Test 2 asm")
@@ -58,9 +56,4 @@
          (mstore)
          (push1 32)
          (push1 0)
-         (return))
-
-    ;; run instructions in offset order
-    (map
-     (λ (i) ((cdr i)))
-     (sort (hash->list instructions) < #:key car))))
+         (return))))

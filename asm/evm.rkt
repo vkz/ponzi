@@ -1,6 +1,7 @@
 #lang racket
 
 (require "semantics.rkt")
+(provide evm)
 
 (define (on-exn e) (halt 'EXN e))
 ;; (define (handle-stop e) (halt 'STOP))
